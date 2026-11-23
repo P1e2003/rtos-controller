@@ -51,6 +51,38 @@ chmod +x reproduce.sh
 
 ---
 
-## Team Workflow & Issue Hand-Out
+## How to Handle a Task (Group Workflow)
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) and the **GitHub Issues** tab (`[US-1.1]` – `[US-3.4]`). Issues are structured in **3 Waves** with disjoint file ownership so 3–4 teammates can work in parallel with minimal merge conflicts.
+Every teammate **must** follow this workflow for all issues (`#1`–`#10`) so nobody duplicates work or causes merge conflicts on `main`:
+
+1. **Choose an Issue on GitHub:**
+   - Open the [Issues](https://github.com/P1e2003/rtos-controller/issues) tab, pick an unassigned issue whose dependencies are merged (check the `wave-1` / `wave-2` / `wave-3` labels), and assign yourself (or comment that you're taking it).
+2. **Mark Your Task on Notion:**
+   - Open the team's [**RTOS Controller Notion Board**](https://app.notion.com/p/4219b538618181a28969dc15f5526875), set yourself in **Owner** on that issue card, and move its status to **In Progress** so the whole group knows which task you are handling.
+3. **Create a Feature Branch from Latest `main`:**
+   - Never commit or push directly to `main`. Always branch from an up-to-date `main` using `feature/<issue-name>`:
+     ```bash
+     git checkout main
+     git pull origin main
+     git checkout -b feature/<issue-name>
+     ```
+     Examples: `feature/models-and-loader`, `feature/posix-pi-demo`, `feature/admission-control`.
+4. **Finish the Task & Run Checks Locally:**
+   - Stick to the files owned by your issue and verify everything passes before pushing:
+     ```bash
+     ruff check sim/ plots/ tests/
+     pytest -v
+     ```
+     *(For `#6 [US-2.4]`, also verify `make -C posix` builds with zero warnings on Linux.)*
+5. **Push Your Branch & Open a Pull Request:**
+   - Push only your feature branch and open a PR targeting `main` with `Closes #<issue_number>` in the description:
+     ```bash
+     git add <your-files>
+     git commit -m "feat(<module>): <short summary>"
+     git push -u origin feature/<issue-name>
+     ```
+   - Update your task status on **Notion** to **In Review** (and paste the PR link).
+6. **Wait for Review & Merge:**
+   - Wait for **@P1e2003** to review and merge your PR into `main` (do not self-merge). Once merged, update your task on **Notion** to **Done** and pull the updated `main` before starting your next issue.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full 3-wave parallel dependency order and Windows→Ubuntu LF line-ending rules.

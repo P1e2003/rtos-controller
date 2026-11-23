@@ -2,22 +2,25 @@
 
 This repository is structured so a **3–4 member team** can work in parallel across cleanly separated modules with minimal merge conflicts.
 
-## 1. Branching & Pull Requests
+## 1. Task Workflow (GitHub + Notion + Pull Requests)
 
-1. **Never push directly to `main`.** Always pull the latest `main` before starting an issue:
+1. **Pick an unassigned GitHub issue** (`#1`–`#10`) whose dependencies are ready, and assign yourself on GitHub.
+2. **Mark the task on Notion** ([RTOS Controller Board](https://app.notion.com/p/4219b538618181a28969dc15f5526875)) by setting yourself in **Owner** and moving status to **In Progress** so teammates know who is handling what.
+3. **Never push directly to `main`.** Always pull the latest `main` and create a `feature/<issue-name>` branch:
    ```bash
    git checkout main
    git pull origin main
-   git checkout -b feature/<short-issue-slug>
+   git checkout -b feature/<issue-name>
    ```
    Example branch names: `feature/models-and-loader`, `feature/posix-pi-demo`, `feature/admission-control`.
-2. **One issue = one focused PR.** Reference your issue in the PR description using `Closes #<issue_number>`.
-3. **Stick to the files owned by your issue.** If you think a shared interface in `sim/models.py` or `sim/engine.py` needs to change, coordinate in the issue comments first so parallel branches do not break.
-4. **Keep CI green before requesting review:**
+4. **Stick to the files owned by your issue.** If you think a shared interface in `sim/models.py` or `sim/engine.py` needs to change, coordinate in the issue comments first so parallel branches do not break.
+5. **Verify checks locally before pushing:**
    ```bash
    ruff check sim/ plots/ tests/
    pytest -v
    ```
+6. **Push your branch & open a PR into `main`:** Push `feature/<issue-name>`, open a Pull Request referencing `Closes #<issue_number>`, and move the task to **In Review** on Notion.
+7. **Wait for review & merge:** Wait for **@P1e2003** to review and merge your PR into `main` (do not self-merge). Once merged, mark the task **Done** on Notion.
 
 ## 2. Parallel Wave Order (3–4 Members)
 
