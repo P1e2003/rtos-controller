@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <time.h>
 
 #define PRIO_L 10
@@ -440,9 +441,15 @@ int main(int argc, char **argv)
     if (pin_single_core() != 0)
         return 1;
 
-    /* Avoid page-fault jitter during timed sections (best-effort). */
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-        perror("mlockall (continuing)");
+    /* Lock memory only when RLIMIT_MEMLOCK is unlimited; calling MCL_FUTURE
+     * under a finite limit (e.g. Ubuntu's default 8 MB) makes pthread_create's
+     * default 8 MB stack mmap fail with EAGAIN before SCHED_FIFO runs. */
+    struct rlimit memlock_limit;
+    if (getrlimit(RLIMIT_MEMLOCK, &memlock_limit) == 0 &&
+        memlock_limit.rlim_cur == RLIM_INFINITY) {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+            perror("mlockall (continuing)");
+    }
 
     const mode_spec_t specs[3] = {
         {PTHREAD_PRIO_NONE, "PTHREAD_PRIO_NONE", "inversion_gt_120ms"},
