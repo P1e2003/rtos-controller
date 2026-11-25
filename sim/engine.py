@@ -261,14 +261,7 @@ class Simulator:
         }
 
         # Create mutexes from critical sections.
-        self.mutexes = {}
-
-        for task in config.tasks:
-            for section in task.sections:
-                if section.resource_id not in self.mutexes:
-                    self.mutexes[section.resource_id] = Mutex(
-                    id=section.resource_id
-            )
+        self.mutexes = self._create_mutexes()
 
         # Active jobs currently in the simulation.
         self.active_jobs = []
@@ -278,7 +271,7 @@ class Simulator:
 
         # Track the next job index for each task.
         self.job_indices = {
-            task.task_id: 0
+            task.id: 0
             for task in config.tasks
         }
 
@@ -309,7 +302,7 @@ class Simulator:
         for resource_id, mutex in mutexes.items():
 
             users = [
-                self.priorities[task.id][0]
+                self.priority_table[task.id][1]
                 for task in self.config.tasks
                 if any(
                     section.resource_id == resource_id
@@ -405,11 +398,12 @@ class Simulator:
     def _task_for_job(self, job: Job) -> Task:
         """Find the task definition associated with a job."""
 
-        for task in self.config.tasks:
-            if task.id == job.task_id:
-                return task
-
-        raise ValueError(f"Unknown task: {job.task_id}")
+        try:
+            return self.tasks_by_id[job.task_id]
+        except KeyError:
+            raise ValueError(
+                f"Unknown task: {job.task_id}"
+            ) from None
 
     def _schedule_and_acquire(self, previous_running_job: Job | None):
         """

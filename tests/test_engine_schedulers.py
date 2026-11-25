@@ -1,4 +1,5 @@
 
+from sim.engine import Simulator
 from sim.models import (
     CriticalSection,
     Job,
@@ -8,8 +9,6 @@ from sim.models import (
     SchedulerType,
     Task,
 )
-
-from sim.engine import Simulator
 from sim.schedulers import (
     assign_priorities_and_levels,
     select_next_job,

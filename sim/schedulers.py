@@ -119,7 +119,11 @@ def select_next_job(
 
         # A currently running job can continue without
         # having to pass the preemption gate again.
-        if running_job is not None and running_job.remaining_exec > 0:
+        if (
+            running_job is not None
+            and running_job in ready_jobs
+            and running_job.remaining_exec > 0
+        ):
 
             candidates = [
                 job
@@ -144,7 +148,10 @@ def select_next_job(
             job
             for job in ready_jobs
             if job.remaining_exec > 0
-            and job.preemption_level > system_ceiling
+            and (
+                job.executed > 0
+                or job.preemption_level > system_ceiling
+            )
         ]
 
         if not eligible_jobs:
