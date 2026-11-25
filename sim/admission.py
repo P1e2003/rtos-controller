@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fractions import Fraction
 from math import ceil
 
 from sim.models import ProtocolType, ScenarioConfig, SchedulerType, Task
@@ -18,7 +19,7 @@ class AdmissionResult:
 def _rank_fixed_priority_tasks(
     tasks: list[Task], scheduler: SchedulerType
 ) -> list[Task]:
-    """Return tasks ordered from highest priority to lowest priority."""
+    """Return tasks ordered from highest priority (index 0) to lowest."""
     if scheduler == SchedulerType.RM:
         return sorted(
             tasks,
@@ -37,7 +38,7 @@ def _push_through_blocking(
     ordered_tasks: list[Task],
     protocol: ProtocolType,
 ) -> int:
-    """Compute maximum blocking from lower-priority tasks' critical sections."""
+    """Compute maximum blocking from lower-priority tasks for fixed-priority."""
     if protocol == ProtocolType.NONE:
         return 0
 
@@ -49,8 +50,8 @@ def _push_through_blocking(
     max_blocking = 0
     for lp_task in lower_priority_tasks:
         for section in lp_task.sections:
-            # Verify exact ceiling / push-through rule against docs/implementation_plan.md
-            max_blocking = max(max_blocking, section.length)
+            if protocol in (ProtocolType.PIP, ProtocolType.ICPP, ProtocolType.SRP):
+                max_blocking = max(max_blocking, section.length)
     return max_blocking
 
 
@@ -60,7 +61,7 @@ def compute_response_time(
     blocking: int,
     max_iterations: int = 10_000,
 ) -> tuple[int, bool]:
-    """Compute worst-case response time R_i via fixed-point iteration."""
+    """Compute worst-case response time R_i via exact integer fixed-point iteration."""
     if blocking < 0:
         raise ValueError("Blocking cannot be negative")
 
@@ -119,18 +120,17 @@ def check_fixed_priority_admission(config: ScenarioConfig) -> AdmissionResult:
 
 
 def check_edf_srp_admission(config: ScenarioConfig) -> AdmissionResult:
-    """Run Baker-style density / SRP admission check for EDF."""
-    densities: dict[str, float] = {}
-    total_density = 0.0
+    """Run Baker's EDF-SRP density check using exact Fraction arithmetic."""
+    densities: dict[str, Fraction] = {}
+    total_density = Fraction(0, 1)
 
     for task in config.tasks:
         effective_deadline = min(task.T, task.D)
-        density = task.C / effective_deadline
+        density = Fraction(task.C, effective_deadline)
         densities[task.id] = density
         total_density += density
 
-    # Verify SRP blocking term formula against docs/implementation_plan.md
-    srp_blocking_term = 0.0
+    srp_blocking_term = Fraction(0, 1)
     if config.protocol == ProtocolType.SRP:
         max_section_len = max(
             (
@@ -142,17 +142,18 @@ def check_edf_srp_admission(config: ScenarioConfig) -> AdmissionResult:
         )
         if max_section_len > 0:
             min_deadline = min(min(task.T, task.D) for task in config.tasks)
-            srp_blocking_term = max_section_len / min_deadline
+            srp_blocking_term = Fraction(max_section_len, min_deadline)
 
     total_load = total_density + srp_blocking_term
-    accepted = total_load <= 1.0
+    accepted = total_load <= Fraction(1, 1)
     reasons = (
         []
         if accepted
         else [
             (
-                f"EDF load={total_load:.4f} exceeds 1.0 "
-                f"(density={total_density:.4f}, srp_term={srp_blocking_term:.4f})"
+                f"EDF load={float(total_load):.4f} exceeds 1.0 "
+                f"(density={float(total_density):.4f}, "
+                f"srp_term={float(srp_blocking_term):.4f})"
             )
         ]
     )

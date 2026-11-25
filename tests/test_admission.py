@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fractions import Fraction
+
 import pytest
 
 from sim.admission import (
@@ -34,7 +36,6 @@ def _make_config(
 
 
 def test_rm_admitted_without_blocking() -> None:
-    # Classic schedulable RM task set: U = 2/5 + 1/10 = 0.50 <= 1.0
     t1 = Task(id="T1", C=2, T=5, D=5)
     t2 = Task(id="T2", C=1, T=10, D=10)
     cfg = _make_config([t2, t1], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE)
@@ -49,7 +50,6 @@ def test_rm_admitted_without_blocking() -> None:
 
 
 def test_rm_rejected_due_to_interference() -> None:
-    # T1 (period 4, C=3) + T2 (period 5, C=3): T2 misses deadline D=5
     t1 = Task(id="T1", C=3, T=4, D=4)
     t2 = Task(id="T2", C=3, T=5, D=5)
     cfg = _make_config([t1, t2], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE)
@@ -61,39 +61,62 @@ def test_rm_rejected_due_to_interference() -> None:
     assert any("T2" in reason for reason in result.reasons)
 
 
-def test_rm_push_through_blocking_causes_rejection() -> None:
-    # T1 has C=2, T=5, D=5 (solo R1=2 <= 5).
-    # T2 has lower priority (T=10, D=10) and holds a critical section of length 4.
-    # With protocol != NONE, push-through blocking adds 4 to T1 -> R1 = 6 > D1 = 5.
+def test_rm_push_through_blocking_pip_edge_case() -> None:
+    # T1 (high prio): C=2, T=5, D=5
+    # T2 (mid prio): C=2, T=8, D=8 (no section)
+    # T3 (low prio): C=5, T=10, D=10, holds critical section length 4 -> push-through to T1
     t1 = Task(id="T1", C=2, T=5, D=5)
-    t2 = Task(
-        id="T2",
-        C=5,
-        T=10,
-        D=10,
+    t2 = Task(id="T2", C=1, T=15, D=15)
+    t3 = Task(
+        id="T3",
+        C=4,
+        T=20,
+        D=20,
         sections=(CriticalSection(offset=0, length=4, resource_id="R_SHARED"),),
     )
 
-    cfg_no_proto = _make_config(
-        [t1, t2], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE
+    cfg_none = _make_config(
+        [t1, t2, t3], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE
     )
-    cfg_with_proto = _make_config(
-        [t1, t2], scheduler=SchedulerType.RM, protocol=ProtocolType.PIP
+    cfg_pip = _make_config(
+        [t1, t2, t3], scheduler=SchedulerType.RM, protocol=ProtocolType.PIP
     )
 
-    res_no_proto = evaluate_admission(cfg_no_proto)
-    res_with_proto = evaluate_admission(cfg_with_proto)
+    res_none = evaluate_admission(cfg_none)
+    res_pip = evaluate_admission(cfg_pip)
 
-    assert res_no_proto.accepted is True
-    assert res_with_proto.accepted is False
-    assert res_with_proto.details["blockings"]["T1"] == 4
-    assert any("T1" in reason for reason in res_with_proto.reasons)
+    assert res_none.accepted is True
+    assert res_none.details["blockings"]["T1"] == 0
+    assert res_pip.accepted is False
+    assert res_pip.details["blockings"]["T1"] == 4
+    assert any("T1" in reason for reason in res_pip.reasons)
+
+
+def test_adjacent_none_protocol_ignores_critical_sections() -> None:
+    # Adjacent critical sections [0, 2) and [2, 4) in T2 under ProtocolType.NONE
+    # must not add blocking to higher-priority T1.
+    t1 = Task(id="T1", C=2, T=6, D=6)
+    t2 = Task(
+        id="T2",
+        C=5,
+        T=12,
+        D=12,
+        sections=(
+            CriticalSection(offset=0, length=2, resource_id="RES_A"),
+            CriticalSection(offset=2, length=2, resource_id="RES_B"),
+        ),
+    )
+    cfg = _make_config([t1, t2], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE)
+
+    res = evaluate_admission(cfg)
+
+    assert res.accepted is True
+    assert res.details["blockings"]["T1"] == 0
+    assert res.details["blockings"]["T2"] == 0
+    assert res.details["response_times"]["T1"] == 2
 
 
 def test_dm_prioritizes_shorter_deadline_over_shorter_period() -> None:
-    # Task A: T=10, D=4, C=2
-    # Task B: T=6,  D=8, C=2
-    # Under DM, Task A (D=4) has higher priority than Task B (D=8).
     task_a = Task(id="TA", C=2, T=10, D=4)
     task_b = Task(id="TB", C=2, T=12, D=8)
     cfg = _make_config([task_a, task_b], scheduler=SchedulerType.DM)
@@ -121,29 +144,31 @@ def test_compute_response_time_negative_blocking_raises() -> None:
         compute_response_time(task, [], blocking=-1)
 
 
-def test_edf_density_admitted_and_rejected() -> None:
-    # Total density = 2/10 + 3/10 = 0.50 <= 1.0 -> accepted
-    t1 = Task(id="T1", C=2, T=10, D=10)
-    t2 = Task(id="T2", C=3, T=10, D=10)
-    ok_cfg = _make_config([t1, t2], scheduler=SchedulerType.EDF, protocol=ProtocolType.NONE)
+def test_edf_equal_d_exact_fraction_boundary() -> None:
+    # Equal relative deadlines D=6: densities 1/6 + 2/6 + 3/6 = 6/6 = Fraction(1, 1) -> accepted
+    t1 = Task(id="T1", C=1, T=10, D=6)
+    t2 = Task(id="T2", C=2, T=10, D=6)
+    t3 = Task(id="T3", C=3, T=10, D=6)
+    ok_cfg = _make_config(
+        [t1, t2, t3], scheduler=SchedulerType.EDF, protocol=ProtocolType.NONE
+    )
     ok_res = evaluate_admission(ok_cfg)
     assert ok_res.accepted is True
-    assert ok_res.details["total_density"] == pytest.approx(0.5)
+    assert ok_res.details["total_density"] == Fraction(1, 1)
+    assert ok_res.details["total_load"] == Fraction(1, 1)
 
-    # Total density = 6/10 + 6/10 = 1.20 > 1.0 -> rejected
-    t3 = Task(id="T3", C=6, T=10, D=10)
-    t4 = Task(id="T4", C=6, T=10, D=10)
+    # Bump T3 C from 3 to 4 -> total_density = 7/6 > 1 -> rejected
+    t3_over = Task(id="T3", C=4, T=10, D=6)
     fail_cfg = _make_config(
-        [t3, t4], scheduler=SchedulerType.EDF, protocol=ProtocolType.NONE
+        [t1, t2, t3_over], scheduler=SchedulerType.EDF, protocol=ProtocolType.NONE
     )
     fail_res = check_edf_srp_admission(fail_cfg)
     assert fail_res.accepted is False
-    assert len(fail_res.reasons) == 1
+    assert fail_res.details["total_density"] == Fraction(7, 6)
 
 
 def test_edf_srp_blocking_pushes_load_over_threshold() -> None:
-    # Density = 3/10 + 3/10 = 0.60, SRP term with section length 5 and min deadline 10 is 0.50
-    # Total load = 1.10 > 1.0 -> rejected under SRP
+    # Density = 5/10 + 3/10 = 4/5, SRP term = 5/10 = 1/2 -> total_load = 13/10 > 1
     t1 = Task(
         id="T1",
         C=5,
@@ -157,5 +182,5 @@ def test_edf_srp_blocking_pushes_load_over_threshold() -> None:
     res = evaluate_admission(cfg)
 
     assert res.accepted is False
-    assert res.details["srp_blocking_term"] == pytest.approx(0.5)
-    assert res.details["total_load"] == pytest.approx(1.3)
+    assert res.details["srp_blocking_term"] == Fraction(1, 2)
+    assert res.details["total_load"] == Fraction(13, 10)
