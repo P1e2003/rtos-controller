@@ -1,8 +1,16 @@
-
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
+
+
+def _require_int(name: str, value: int) -> None:
+    """Reject values that are not actual integers, including booleans."""
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer")
+
 
 # ENUMS
+
 
 class SchedulerType(str, Enum):
     RM = "RM"
@@ -49,13 +57,17 @@ class MissCause(str, Enum):
 
 # CRITICAL SECTION
 
+
 @dataclass
 class CriticalSection:
     offset: int
     length: int
     resource_id: str
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        _require_int("offset", self.offset)
+        _require_int("length", self.length)
+
         if self.offset < 0:
             raise ValueError("Critical section offset cannot be negative")
 
@@ -66,11 +78,12 @@ class CriticalSection:
             raise ValueError("Resource ID cannot be empty")
 
     @property
-    def end(self):
+    def end(self) -> int:
         return self.offset + self.length
 
 
 # TASK
+
 
 @dataclass
 class Task:
@@ -83,14 +96,18 @@ class Task:
     bcet: int | None = None
     sections: tuple[CriticalSection, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        for name in ("C", "T", "D", "phase"):
+            _require_int(name, getattr(self, name))
+
+        if self.bcet is not None:
+            _require_int("bcet", self.bcet)
+
         if not self.id or not self.id.strip():
             raise ValueError("Task ID cannot be empty")
 
         if not (0 < self.C <= self.D <= self.T):
-            raise ValueError(
-                "Task must satisfy 0 < C <= D <= T"
-            )
+            raise ValueError("Task must satisfy 0 < C <= D <= T")
 
         if self.phase < 0:
             raise ValueError("Task phase cannot be negative")
@@ -101,31 +118,32 @@ class Task:
         if not (0 < self.bcet <= self.C):
             raise ValueError("BCET must satisfy 0 < BCET <= C")
 
-        self.sections = tuple(self.sections)
-
-        ordered_sections = sorted(
-            self.sections,
-            key=lambda section: section.offset,
+        ordered_sections = tuple(
+            sorted(self.sections, key=lambda section: section.offset)
         )
+        self.sections = ordered_sections
 
         previous_end = 0
 
-        for section in ordered_sections:
+        for section in self.sections:
+            if not isinstance(section, CriticalSection):
+                raise TypeError(
+                    "Task sections must contain CriticalSection objects"
+                )
+
             if section.end > self.C:
                 raise ValueError(
                     "Critical section must be within task execution time"
                 )
 
             if section.offset < previous_end:
-                raise ValueError(
-                    "Critical sections cannot overlap"
-                )
+                raise ValueError("Critical sections cannot overlap")
 
             previous_end = section.end
 
-        if ordered_sections:
+        if self.sections:
             latest_end = max(
-                section.end for section in ordered_sections
+                section.end for section in self.sections
             )
 
             if self.bcet < latest_end:
@@ -134,17 +152,9 @@ class Task:
                     "critical section"
                 )
 
-    # Compatibility with the earlier engine implementation.
-    @property
-    def task_id(self):
-        return self.id
-
-    @property
-    def critical_sections(self):
-        return self.sections
-
 
 # JOB
+
 
 @dataclass
 class Job:
@@ -173,26 +183,37 @@ class Job:
     )
 
     @property
-    def job_id(self):
+    def job_id(self) -> str:
         return f"{self.task_id}_{self.job_index}"
 
 
 # MUTEX
 
+
 @dataclass
 class Mutex:
     id: str
     ceiling: int = 0
-    owner: str | None = None
-    wait_queue: list[str] = field(default_factory=list)
+    owner: Job | None = None
+    wait_queue: list[Job] = field(default_factory=list)
 
-    # Compatibility with the earlier engine implementation.
-    @property
-    def resource_id(self):
-        return self.id
+
+# TASK SET VALIDATION
+
+
+def validate_task_set(tasks: list[Task]) -> None:
+    """Validate that a task set is non-empty and has unique task IDs."""
+    if not tasks:
+        raise ValueError("Scenario must contain at least one task")
+
+    task_ids = [task.id for task in tasks]
+
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("Task IDs must be unique")
 
 
 # SCENARIO CONFIGURATION
+
 
 @dataclass
 class ScenarioConfig:
@@ -208,27 +229,35 @@ class ScenarioConfig:
     jitter_enabled: bool = False
     overrun_factor: float = 1.0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        _require_int("duration", self.duration)
+        _require_int("overhead_epsilon", self.overhead_epsilon)
+        _require_int("seed", self.seed)
+
         if not self.name or not self.name.strip():
             raise ValueError("Scenario name cannot be empty")
 
         if self.duration <= 0:
             raise ValueError("Duration must be positive")
 
-        if not self.tasks:
-            raise ValueError("Scenario must contain at least one task")
-
-        task_ids = [task.id for task in self.tasks]
-
-        if len(task_ids) != len(set(task_ids)):
-            raise ValueError("Task IDs must be unique")
+        validate_task_set(self.tasks)
 
         if self.overhead_epsilon < 0:
             raise ValueError("Overhead epsilon cannot be negative")
 
-        if self.overrun_factor <= 0:
-            raise ValueError("Overrun factor must be positive")
+        if (
+            isinstance(self.overrun_factor, bool)
+            or not isinstance(self.overrun_factor, (int, float))
+        ):
+            raise TypeError("Overrun factor must be a number")
 
+        if (
+            not isfinite(self.overrun_factor)
+            or self.overrun_factor <= 0
+        ):
+            raise ValueError(
+                "Overrun factor must be positive and finite"
+            )
 
 
 # TICK RECORD
@@ -245,6 +274,7 @@ class TickRecord:
 
 
 # SIMULATION RESULT
+
 
 @dataclass
 class SimulationResult:

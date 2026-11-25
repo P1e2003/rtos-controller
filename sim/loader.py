@@ -14,13 +14,8 @@ from sim.models import (
 )
 
 
-def compute_hyperperiod(tasks):
-    """
-    Calculate the hyperperiod of a task set.
-
-    The hyperperiod is the least common multiple
-    of all task periods.
-    """
+def compute_hyperperiod(tasks: list[Task]) -> int:
+    """Calculate the least common multiple of all task periods."""
     if not tasks:
         raise ValueError("Cannot calculate hyperperiod of an empty task set")
 
@@ -32,16 +27,12 @@ def compute_hyperperiod(tasks):
     return lcm(*periods)
 
 
-def load_scenario(path):
+def load_scenario(path: str | Path) -> ScenarioConfig:
     """
     Load a YAML scenario and convert it into a ScenarioConfig.
 
-    Duration can be:
-        - An integer
-        - 'auto'
-        - Omitted (automatically calculated)
+    Duration can be an integer, 'auto', 'AUTO', null, or omitted.
     """
-
     path = Path(path)
 
     if not path.exists():
@@ -52,8 +43,6 @@ def load_scenario(path):
 
     if not isinstance(data, dict):
         raise TypeError("Scenario YAML must contain a dictionary")
-
-    # Read basic scenario information
 
     name = data.get("name", path.stem)
 
@@ -69,23 +58,30 @@ def load_scenario(path):
         data.get("overload_policy", "CONTINUE").upper()
     )
 
-    # Read tasks
-
-
     task_data = data.get("tasks")
 
     if not isinstance(task_data, list) or not task_data:
         raise ValueError("Scenario must contain a non-empty task list")
 
-    tasks = []
+    tasks: list[Task] = []
 
     for item in task_data:
         if not isinstance(item, dict):
             raise TypeError("Each task must be a YAML dictionary")
 
-        sections = []
+        section_data = item.get("sections") or []
 
-        for section in item.get("critical_sections", []):
+        if not isinstance(section_data, list):
+            raise TypeError("Task sections must be a YAML list or null")
+
+        sections: list[CriticalSection] = []
+
+        for section in section_data:
+            if not isinstance(section, dict):
+                raise TypeError(
+                    "Each critical section must be a YAML dictionary"
+                )
+
             sections.append(
                 CriticalSection(
                     offset=section["offset"],
@@ -107,21 +103,25 @@ def load_scenario(path):
 
         tasks.append(task)
 
-
-    # Calculate simulation duration
-
     duration = data.get("duration", "auto")
 
-    if duration == "auto" or duration is None:
-        duration = max(task.phase for task in tasks) + compute_hyperperiod(tasks)
+    if (
+        duration is None
+        or (
+            isinstance(duration, str)
+            and duration.strip().upper() == "AUTO"
+        )
+    ):
+        duration = (
+            max(task.phase for task in tasks)
+            + compute_hyperperiod(tasks)
+        )
 
-    if not isinstance(duration, int) or isinstance(duration, bool):
+    if type(duration) is not int:
         raise TypeError("Duration must be a positive integer or 'auto'")
 
     if duration <= 0:
         raise ValueError("Duration must be positive")
-
-    # Build ScenarioConfig
 
     return ScenarioConfig(
         name=name,
