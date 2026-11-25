@@ -3,9 +3,10 @@ import random
 from sim.models import (
     CriticalSection,
     Job,
-    MissCause,
     Mutex,
     OverloadPolicy,
+    ScenarioConfig,
+    SchedulerType,
     SimulationResult,
     Task,
     TickCategory,
@@ -24,14 +25,14 @@ def job_identifier(job: Job) -> str:
 
 class DefaultProtocolHandler:
     """
-    Basic mutex implementation used when the real protocol
-    implementation is unavailable.
+    Basic NONE mutex implementation used when sim.protocols
+    is unavailable.
 
-    This handler provides exclusive resource ownership,
-    FIFO waiting and ownership transfer.
+    Clears ownership on release and wakes all waiters so the
+    scheduler dispatches the highest-priority ready job next.
     """
 
-    def system_ceiling(self) -> int:
+    def system_ceiling(self, mutexes: dict[str, Mutex]) -> int:
         return 0
 
     def try_acquire(
@@ -39,8 +40,7 @@ class DefaultProtocolHandler:
         job: Job,
         resource_id: str,
         mutexes: dict[str, Mutex],
-    ) -> bool:
-
+    ) -> tuple[bool, int]:
         mutex = mutexes.get(resource_id)
 
         if mutex is None:
@@ -53,64 +53,56 @@ class DefaultProtocolHandler:
                 job.held_resources.append(resource_id)
 
             job.blocked_on = None
-            return True
+            return True, 0
 
         if mutex.owner is job:
-            return True
+            return True, 0
 
         if job not in mutex.wait_queue:
             mutex.wait_queue.append(job)
 
         job.blocked_on = resource_id
-        return False
+        return False, 0
 
     def release(
         self,
         job: Job,
         resource_id: str,
         mutexes: dict[str, Mutex],
-    ) -> None:
-
+    ) -> int:
         mutex = mutexes.get(resource_id)
 
-        if mutex is None:
-            return
-
-        if mutex.owner is not job:
-            return
+        if mutex is None or mutex.owner is not job:
+            return 0
 
         mutex.owner = None
 
         if resource_id in job.held_resources:
             job.held_resources.remove(resource_id)
 
-        # Transfer ownership to the first waiting job.
-        while mutex.wait_queue:
-            next_job = mutex.wait_queue.pop(0)
+        # Wake waiters without directly transferring ownership so the
+        # scheduler selects the highest-priority ready job on next dispatch.
+        for waiter in mutex.wait_queue:
+            if waiter.blocked_on == resource_id:
+                waiter.blocked_on = None
 
-            if next_job.remaining_exec <= 0:
-                next_job.blocked_on = None
-                continue
+        mutex.wait_queue.clear()
+        return 0
 
-            mutex.owner = next_job
-
-            if resource_id not in next_job.held_resources:
-                next_job.held_resources.append(resource_id)
-
-            next_job.blocked_on = None
-            break
-
-    def remove_from_wait_queues(
+    def on_job_abort(
         self,
         job: Job,
         mutexes: dict[str, Mutex],
-    ) -> None:
+    ) -> int:
+        for resource_id in list(job.held_resources):
+            self.release(job, resource_id, mutexes)
 
         for mutex in mutexes.values():
             if job in mutex.wait_queue:
                 mutex.wait_queue.remove(job)
 
         job.blocked_on = None
+        return 0
 
 
 class DefaultAttributionHandler:
@@ -128,24 +120,20 @@ class DefaultAttributionHandler:
         running_job: Job | None,
         is_overhead: bool,
         system_ceiling: int,
+        mutexes: dict[str, Mutex],
+        scheduler: SchedulerType,
     ) -> TickRecord:
-
-        job_states = {}
+        job_states: dict[str, TickCategory] = {}
 
         for job in active_jobs:
-
-            if job is running_job:
-
-                if is_overhead:
-                    category = TickCategory.OVERHEAD
-                else:
-                    category = TickCategory.RUNNING
-
+            if is_overhead:
+                category = TickCategory.OVERHEAD
+            elif job is running_job:
+                category = TickCategory.RUNNING
             else:
                 category = TickCategory.INTERFERENCE
 
             job.tick_counts[category] += 1
-
             job_states[job_identifier(job)] = category
 
         return TickRecord(
@@ -166,28 +154,7 @@ class DefaultAttributionHandler:
         )
 
 
-def _snapshot_priorities(jobs: list[Job]) -> dict[int, tuple[int, int]]:
-    """Capture effective priorities and preemption levels."""
-    return {
-        id(job): (job.effective_priority, job.preemption_level)
-        for job in jobs
-    }
-
-
-def _count_priority_changes(
-    jobs: list[Job],
-    before: dict[int, tuple[int, int]],
-) -> int:
-    """Count jobs whose effective priority or level changed."""
-    return sum(
-        1
-        for job in jobs
-        if id(job) in before
-        and before[id(job)]
-        != (job.effective_priority, job.preemption_level)
-    )
-
-def _load_optional_handler(module_name, factory_name, config):
+def _load_optional_handler(module_name: str, factory_name: str, *args):
     """Load a handler if the module exposes its agreed factory."""
     from importlib import import_module
 
@@ -201,12 +168,13 @@ def _load_optional_handler(module_name, factory_name, config):
     if factory is None:
         return None
 
-    return factory(config)
+    return factory(*args)
+
 
 class Simulator:
     def __init__(
         self,
-        config,
+        config: ScenarioConfig,
         protocol_handler=None,
         attribution_handler=None,
         exec_time_fn=None,
@@ -223,7 +191,8 @@ class Simulator:
             or _load_optional_handler(
                 "sim.protocols",
                 "create_protocol_handler",
-                config,
+                config.protocol,
+                config.scheduler,
             )
             or DefaultProtocolHandler()
         )
@@ -405,95 +374,30 @@ class Simulator:
                 f"Unknown task: {job.task_id}"
             ) from None
 
-    def _schedule_and_acquire(self, previous_running_job: Job | None):
-        """
-        Repeatedly select a job and attempt lock acquisition.
-
-        A blocked job is removed from the ready set, and
-        scheduling is repeated within the same tick.
-        """
-
-        while True:
-
-            ready_jobs = self._ready_jobs()
-
-            current_running = (
-                previous_running_job
-                if previous_running_job in ready_jobs
-                else None
-            )
-
-            selected_job = select_next_job(
-                ready_jobs=ready_jobs,
-                running_job=current_running,
-                scheduler=self.config.scheduler,
-                protocol=self.config.protocol,
-                system_ceiling=self.protocol_handler.system_ceiling(),
-            )
-
-            if selected_job is None:
-                return None
-
-            section = self._find_critical_section(selected_job)
-
-            if section is None:
-                return selected_job
-
-            before = _snapshot_priorities(self.active_jobs)
-
-            acquired = self.protocol_handler.try_acquire(
-                selected_job,
-                section.resource_id,
-                self.mutexes,
-            )
-
-            self.priority_changes += _count_priority_changes(
-                self.active_jobs,
-                before,
-            )
-
-            if acquired:
-                self.lock_ops += 1
-                continue
-
-            # The job is blocked. Re-select within this tick.
-            selected_job.blocked_on = section.resource_id
-
     def _release_resource(self, job: Job, resource_id: str) -> None:
         """Release a mutex and account for protocol priority changes."""
 
-        before = _snapshot_priorities(self.active_jobs)
-
-        self.protocol_handler.release(
+        delta = self.protocol_handler.release(
             job,
             resource_id,
             self.mutexes,
         )
 
         self.lock_ops += 1
-
-        self.priority_changes += _count_priority_changes(
-            self.active_jobs,
-            before,
-        )
+        self.priority_changes += delta
 
     def _release_all_resources(self, job: Job) -> None:
         """Defensively release all resources held by a job."""
 
-        for resource_id in list(job.held_resources):
-            self._release_resource(job, resource_id)
+        held_count = len(job.held_resources)
 
-        # A terminated or aborted job must not remain in a wait queue.
-        if hasattr(self.protocol_handler, "remove_from_wait_queues"):
-            self.protocol_handler.remove_from_wait_queues(
-                job,
-                self.mutexes,
-            )
-        else:
-            for mutex in self.mutexes.values():
-                if job in mutex.wait_queue:
-                    mutex.wait_queue.remove(job)
+        delta = self.protocol_handler.on_job_abort(
+            job,
+            self.mutexes,
+        )
 
+        self.lock_ops += held_count
+        self.priority_changes += delta
         job.blocked_on = None
 
     def _handle_execution_completion(
@@ -532,15 +436,8 @@ class Simulator:
                 continue
 
             if not job.missed:
+                # Mark miss once; detailed MissCause belongs to sim.attribution.
                 job.missed = True
-
-                # The engine marks the miss once.
-                # Detailed causal classification belongs to
-                # the attribution module.
-                if job.miss_cause is None:
-                    job.miss_cause = (
-                        MissCause.OVERRUN_OR_OVERHEAD_MISS
-                    )
 
             if self.config.overload_policy == OverloadPolicy.ABORT:
 
@@ -552,7 +449,7 @@ class Simulator:
     def run(self) -> SimulationResult:
         """Execute the complete deterministic simulation."""
 
-        previous_running_job = None
+        previous_running_job: Job | None = None
         overhead_remaining = 0
 
         for tick in range(self.config.duration):
@@ -561,47 +458,83 @@ class Simulator:
 
             self._release_new_jobs(tick)
 
-            # 2. SCHEDULE AND LOCK ACQUISITION
+            # 2 & 3. SCHEDULE, OVERHEAD, AND LOCK ACQUISITION
 
-            selected_job = self._schedule_and_acquire(
-                previous_running_job
-            )
-
-            executed_job = None
+            executed_job: Job | None = None
             is_overhead = False
 
-            # 3. CONTEXT SWITCH / OVERHEAD
+            while True:
+                ready_jobs = self._ready_jobs()
 
-            if selected_job is None:
+                current_running = (
+                    previous_running_job
+                    if previous_running_job in ready_jobs
+                    else None
+                )
 
-                previous_running_job = None
-                overhead_remaining = 0
+                selected_job = select_next_job(
+                    ready_jobs=ready_jobs,
+                    running_job=current_running,
+                    scheduler=self.config.scheduler,
+                    protocol=self.config.protocol,
+                    system_ceiling=self.protocol_handler.system_ceiling(
+                        self.mutexes
+                    ),
+                )
 
-            else:
+                if selected_job is None:
+                    previous_running_job = None
+                    overhead_remaining = 0
+                    break
+
+                # Consume context-switch overhead before acquiring new locks
+                # so a newly switched-in job never holds a mutex at executed=0.
+                if (
+                    selected_job is not previous_running_job
+                    and previous_running_job is not None
+                    and self.config.overhead_epsilon > 0
+                ):
+                    self.context_switches += 1
+                    overhead_remaining = self.config.overhead_epsilon
+                    previous_running_job = selected_job
+
+                if overhead_remaining > 0:
+                    is_overhead = True
+                    overhead_remaining -= 1
+                    self.overhead_ticks += 1
+                    previous_running_job = selected_job
+                    break
+
+                section = self._find_critical_section(selected_job)
+
+                if section is not None:
+                    acquired, delta = self.protocol_handler.try_acquire(
+                        selected_job,
+                        section.resource_id,
+                        self.mutexes,
+                    )
+
+                    self.priority_changes += delta
+
+                    if acquired:
+                        self.lock_ops += 1
+                        continue
+
+                    # Blocked on mutex: re-select a runnable job within this tick.
+                    selected_job.blocked_on = section.resource_id
+                    continue
+
                 if (
                     selected_job is not previous_running_job
                     and previous_running_job is not None
                 ):
                     self.context_switches += 1
-                    overhead_remaining = (
-                        self.config.overhead_epsilon
-                    )
 
-                if overhead_remaining > 0:
-
-                    is_overhead = True
-                    overhead_remaining -= 1
-                    self.overhead_ticks += 1
-
-                else:
-
-                    selected_job.executed += 1
-                    selected_job.remaining_exec -= 1
-
-                    executed_job = selected_job
-
-                # Preserve dispatch identity even during overhead.
+                selected_job.executed += 1
+                selected_job.remaining_exec -= 1
+                executed_job = selected_job
                 previous_running_job = selected_job
+                break
 
             # 4. PER-TICK ATTRIBUTION
 
@@ -609,13 +542,13 @@ class Simulator:
                 self.attribution_handler.record_tick(
                     tick=tick,
                     active_jobs=list(self.active_jobs),
-                    running_job=(
-                        selected_job if is_overhead else executed_job
-                    ),
+                    running_job=None if is_overhead else executed_job,
                     is_overhead=is_overhead,
-                    system_ceiling=(
-                        self.protocol_handler.system_ceiling()
+                    system_ceiling=self.protocol_handler.system_ceiling(
+                        self.mutexes
                     ),
+                    mutexes=self.mutexes,
+                    scheduler=self.config.scheduler,
                 )
             )
 
