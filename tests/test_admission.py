@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fractions import Fraction
+import json
+from dataclasses import asdict
 
 import pytest
 
@@ -40,8 +41,10 @@ def test_rta_accepts_liu_layland_exceeding_harmonic_set() -> None:
     assert isinstance(result, AdmissionResult)
     assert result.accepted is True
     assert result.rejection_reason is None
-    assert result.total_utilization == Fraction(19, 20)
+    assert isinstance(result.total_utilization, float)
+    assert result.total_utilization == pytest.approx(0.95)
     assert _detail_by_id(result, "T1").response_time == 2
+    assert _detail_by_id(result, "T1").density_lhs is None
     assert _detail_by_id(result, "T2").response_time == 5
     assert _detail_by_id(result, "T3").response_time == 19
 
@@ -192,7 +195,17 @@ def test_baker_edf_srp_exact_rational_and_rejects_non_srp_shared() -> None:
 
     res_srp = check_admission([t1, t2, t3], SchedulerType.EDF, ProtocolType.SRP)
     assert res_srp.accepted is True
-    assert _detail_by_id(res_srp, "T3").density_lhs == Fraction(1, 1)
+    assert _detail_by_id(res_srp, "T3").density_lhs == pytest.approx(1.0)
+
+    # Exact rational precision: 1/3 + 1/3 + 1/3 == 1 (must accept without float drift)
+    thirds = [
+        Task(id="A", C=1, T=3, D=3),
+        Task(id="B", C=1, T=3, D=3),
+        Task(id="C", C=1, T=3, D=3),
+    ]
+    res_thirds = check_admission(thirds, SchedulerType.EDF, ProtocolType.SRP)
+    assert res_thirds.accepted is True
+    assert _detail_by_id(res_thirds, "C").density_lhs == pytest.approx(1.0)
 
     # Shared lock under EDF + NONE or EDF + PIP must be rejected
     s1 = Task(
@@ -241,3 +254,167 @@ def test_compute_response_time_and_evaluate_admission_wrapper() -> None:
     )
     wrapped = evaluate_admission(cfg)
     assert wrapped.accepted is True
+
+
+def test_icpp_and_srp_accept_lock_free_task_sets() -> None:
+    tasks = [
+        Task(id="H", C=1, T=5, D=5),
+        Task(id="L", C=1, T=10, D=10),
+    ]
+
+    for scheduler in (SchedulerType.RM, SchedulerType.DM):
+        for protocol in (ProtocolType.ICPP, ProtocolType.SRP):
+            result = check_admission(tasks, scheduler, protocol)
+            assert result.accepted is True
+            assert _detail_by_id(result, "H").blocking_bound == 0
+            assert _detail_by_id(result, "H").density_lhs is None
+            assert _detail_by_id(result, "L").blocking_bound == 0
+
+
+def test_icpp_blocking_scans_all_lower_priority_tasks_and_sections() -> None:
+    # Asymmetric multi-LP lengths: L1 holds S1 (len 2), L2 holds S2 (len 6) -> B_H must be 6
+    asymmetric = [
+        Task(
+            id="H",
+            C=2,
+            T=10,
+            D=10,
+            bcet=2,
+            sections=(
+                CriticalSection(offset=0, length=1, resource_id="S1"),
+                CriticalSection(offset=1, length=1, resource_id="S2"),
+            ),
+        ),
+        Task(
+            id="L1",
+            C=3,
+            T=20,
+            D=20,
+            bcet=3,
+            sections=(CriticalSection(offset=0, length=2, resource_id="S1"),),
+        ),
+        Task(
+            id="L2",
+            C=7,
+            T=30,
+            D=30,
+            bcet=7,
+            sections=(CriticalSection(offset=0, length=6, resource_id="S2"),),
+        ),
+    ]
+    res_asym = check_admission(asymmetric, SchedulerType.RM, ProtocolType.ICPP)
+    assert _detail_by_id(res_asym, "H").blocking_bound == 6
+    assert _detail_by_id(res_asym, "H").response_time == 8
+
+    # Private critical section listed before shared resource S (len 4) -> B_H must be 4
+    private_first = [
+        Task(
+            id="H",
+            C=2,
+            T=10,
+            D=10,
+            bcet=2,
+            sections=(CriticalSection(offset=0, length=1, resource_id="S"),),
+        ),
+        Task(
+            id="L",
+            C=6,
+            T=20,
+            D=20,
+            bcet=6,
+            sections=(
+                CriticalSection(offset=0, length=1, resource_id="PRIV"),
+                CriticalSection(offset=1, length=4, resource_id="S"),
+            ),
+        ),
+    ]
+    res_priv = check_admission(private_first, SchedulerType.RM, ProtocolType.ICPP)
+    assert _detail_by_id(res_priv, "H").blocking_bound == 4
+    assert _detail_by_id(res_priv, "H").response_time == 6
+
+    # Intervening M with private lock must not hide L's shared BUS section (len 8)
+    pathfinder_m_priv = [
+        Task(
+            id="H",
+            C=3,
+            T=20,
+            D=20,
+            bcet=3,
+            sections=(CriticalSection(offset=1, length=1, resource_id="BUS"),),
+        ),
+        Task(
+            id="M",
+            C=5,
+            T=40,
+            D=40,
+            bcet=5,
+            sections=(CriticalSection(offset=0, length=1, resource_id="M_PRIV"),),
+        ),
+        Task(
+            id="L",
+            C=10,
+            T=80,
+            D=80,
+            bcet=10,
+            sections=(CriticalSection(offset=0, length=8, resource_id="BUS"),),
+        ),
+    ]
+    res_mp = check_admission(pathfinder_m_priv, SchedulerType.RM, ProtocolType.ICPP)
+    assert _detail_by_id(res_mp, "H").blocking_bound == 8
+
+
+def test_edf_srp_accepts_mars_pathfinder_and_result_is_json_serializable() -> None:
+    pathfinder = [
+        Task(
+            id="H",
+            C=3,
+            T=20,
+            D=20,
+            bcet=3,
+            sections=(CriticalSection(offset=1, length=1, resource_id="BUS"),),
+        ),
+        Task(id="M", C=5, T=40, D=40),
+        Task(
+            id="L",
+            C=10,
+            T=80,
+            D=80,
+            bcet=10,
+            sections=(CriticalSection(offset=0, length=8, resource_id="BUS"),),
+        ),
+    ]
+
+    res_edf = check_admission(pathfinder, SchedulerType.EDF, ProtocolType.SRP)
+    assert res_edf.accepted is True
+    assert res_edf.rejection_reason is None
+    assert _detail_by_id(res_edf, "H").blocking_bound == 8
+    assert _detail_by_id(res_edf, "H").density_lhs == pytest.approx(11 / 20)
+    assert _detail_by_id(res_edf, "M").blocking_bound == 8
+    assert _detail_by_id(res_edf, "M").density_lhs == pytest.approx(19 / 40)
+    assert _detail_by_id(res_edf, "L").blocking_bound == 0
+    assert _detail_by_id(res_edf, "L").density_lhs == pytest.approx(2 / 5)
+
+    res_rm = check_admission(pathfinder, SchedulerType.RM, ProtocolType.ICPP)
+    assert res_rm.accepted is True
+    for result in (res_edf, res_rm):
+        payload = json.dumps(asdict(result))
+        decoded = json.loads(payload)
+        assert isinstance(decoded["total_utilization"], float)
+
+
+def test_rm_and_dm_tie_breaking_matches_schedulers() -> None:
+    tasks = [
+        Task(id="A", C=2, T=10, D=10),
+        Task(id="B", C=5, T=10, D=6),
+    ]
+
+    res_rm = check_admission(tasks, SchedulerType.RM, ProtocolType.NONE)
+    assert res_rm.accepted is False
+    assert _detail_by_id(res_rm, "A").response_time == 2
+    assert _detail_by_id(res_rm, "B").response_time == 7
+    assert _detail_by_id(res_rm, "B").schedulable is False
+
+    res_dm = check_admission(tasks, SchedulerType.DM, ProtocolType.NONE)
+    assert res_dm.accepted is True
+    assert _detail_by_id(res_dm, "B").response_time == 5
+    assert _detail_by_id(res_dm, "A").response_time == 7

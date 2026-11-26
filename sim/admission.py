@@ -22,7 +22,7 @@ class TaskAdmissionDetail:
     deadline: int
     blocking_bound: int
     response_time: int | None
-    density_lhs: Fraction
+    density_lhs: float | None
     schedulable: bool
     reason: str | None = None
 
@@ -32,7 +32,7 @@ class AdmissionResult:
     accepted: bool
     scheduler: SchedulerType
     protocol: ProtocolType
-    total_utilization: Fraction
+    total_utilization: float
     details: list[TaskAdmissionDetail] = field(default_factory=list)
     rejection_reason: str | None = None
 
@@ -121,7 +121,7 @@ def _fixed_priority_blocking(
             for sec in lp.sections:
                 if ceilings.get(sec.resource_id, 0) >= target_prio:
                     max_len = max(max_len, sec.length)
-                return max_len
+        return max_len
 
     if protocol == ProtocolType.PIP:
         # Term 1: sum_{k in lp(i)} max_{r in cs(k), ceiling[r] >= P_i} L_{k,r}
@@ -129,7 +129,7 @@ def _fixed_priority_blocking(
         for lp in lp_tasks:
             max_for_lp = 0
             for sec in lp.sections:
-                if ceilings.get(sec.resource_id, 0) >= target_prio and sec.length > max_for_lp:
+                if ceilings.get(sec.resource_id, 0) >= target_prio:
                     max_for_lp = max(max_for_lp, sec.length)
             per_task_sum += max_for_lp
 
@@ -142,7 +142,7 @@ def _fixed_priority_blocking(
             max_for_res = 0
             for lp in lp_tasks:
                 for sec in lp.sections:
-                    if sec.resource_id == rid and sec.length > max_for_res:
+                    if sec.resource_id == rid:
                         max_for_res = max(max_for_res, sec.length)
             per_res_sum += max_for_res
 
@@ -187,7 +187,7 @@ def _check_fixed_priority(
 ) -> AdmissionResult:
     ordered = _rank_fixed_priority_tasks(tasks, scheduler)
     ceilings = _compute_ceilings(ordered)
-    total_util = sum((Fraction(t.C, t.T) for t in ordered), Fraction(0, 1))
+    total_util = float(sum((Fraction(t.C, t.T) for t in ordered), Fraction(0, 1)))
 
     if protocol == ProtocolType.NONE and _has_none_inversion_band(ordered):
         details = [
@@ -198,7 +198,7 @@ def _check_fixed_priority(
                 deadline=t.D,
                 blocking_bound=0,
                 response_time=None,
-                density_lhs=Fraction(t.C, min(t.T, t.D)),
+                density_lhs=None,
                 schedulable=False,
                 reason="unbounded_priority_inversion_under_none",
             )
@@ -221,7 +221,6 @@ def _check_fixed_priority(
         hp_tasks = ordered[:idx]
         blocking = _fixed_priority_blocking(idx, ordered, protocol, ceilings)
         r_time, ok = compute_response_time(task, hp_tasks, blocking)
-        lhs = Fraction(task.C, min(task.T, task.D)) + Fraction(blocking, task.D)
         reason = None if ok else f"R={r_time} > D={task.D} (B={blocking})"
         if not ok:
             all_ok = False
@@ -236,7 +235,7 @@ def _check_fixed_priority(
                 deadline=task.D,
                 blocking_bound=blocking,
                 response_time=r_time,
-                density_lhs=lhs,
+                density_lhs=None,
                 schedulable=ok,
                 reason=reason,
             )
@@ -254,7 +253,7 @@ def _check_fixed_priority(
 
 def _check_edf(tasks: list[Task], protocol: ProtocolType) -> AdmissionResult:
     ordered = sorted(tasks, key=lambda t: (t.D, t.id))
-    total_util = sum((Fraction(t.C, t.T) for t in ordered), Fraction(0, 1))
+    total_util = float(sum((Fraction(t.C, t.T) for t in ordered), Fraction(0, 1)))
     shared_res = _find_shared_resources(ordered)
 
     if shared_res and protocol != ProtocolType.SRP:
@@ -266,7 +265,7 @@ def _check_edf(tasks: list[Task], protocol: ProtocolType) -> AdmissionResult:
                 deadline=t.D,
                 blocking_bound=0,
                 response_time=None,
-                density_lhs=Fraction(t.C, t.D),
+                density_lhs=None,
                 schedulable=False,
                 reason="edf_shared_resources_require_srp",
             )
@@ -296,8 +295,8 @@ def _check_edf(tasks: list[Task], protocol: ProtocolType) -> AdmissionResult:
         if protocol == ProtocolType.SRP:
             for lower_task in ordered[k_idx + 1 :]:
                 for sec in lower_task.sections:
-                    if ceilings.get(sec.resource_id, 0) >= pi_k and sec.length > b_k:
-                            b_k = max(b_k, sec.length)
+                    if ceilings.get(sec.resource_id, 0) >= pi_k:
+                        b_k = max(b_k, sec.length)
 
         lhs_k = cumulative_density + Fraction(b_k, task.D)
         ok = lhs_k <= Fraction(1, 1)
@@ -315,7 +314,7 @@ def _check_edf(tasks: list[Task], protocol: ProtocolType) -> AdmissionResult:
                 deadline=task.D,
                 blocking_bound=b_k,
                 response_time=None,
-                density_lhs=lhs_k,
+                density_lhs=float(lhs_k),
                 schedulable=ok,
                 reason=reason,
             )
