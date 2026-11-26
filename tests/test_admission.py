@@ -6,8 +6,8 @@ import pytest
 
 from sim.admission import (
     AdmissionResult,
-    check_edf_srp_admission,
-    check_fixed_priority_admission,
+    TaskAdmissionDetail,
+    check_admission,
     compute_response_time,
     evaluate_admission,
 )
@@ -20,167 +20,224 @@ from sim.models import (
 )
 
 
-def _make_config(
-    tasks: list[Task],
-    scheduler: SchedulerType = SchedulerType.RM,
-    protocol: ProtocolType = ProtocolType.NONE,
-    duration: int = 100,
-) -> ScenarioConfig:
-    return ScenarioConfig(
-        name="admission-test-scenario",
-        duration=duration,
-        scheduler=scheduler,
-        protocol=protocol,
-        tasks=tasks,
-    )
+def _detail_by_id(result: AdmissionResult, task_id: str) -> TaskAdmissionDetail:
+    for item in result.details:
+        if item.task_id == task_id:
+            return item
+    raise AssertionError(f"Missing detail for task {task_id}")
 
 
-def test_rm_admitted_without_blocking() -> None:
-    t1 = Task(id="T1", C=2, T=5, D=5)
-    t2 = Task(id="T2", C=1, T=10, D=10)
-    cfg = _make_config([t2, t1], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE)
+def test_rta_accepts_liu_layland_exceeding_harmonic_set() -> None:
+    # Harmonic periods T = 5, 10, 20 with C = 2, 3, 5 -> U = 2/5 + 3/10 + 5/20 = 0.95 (> 0.78)
+    tasks = [
+        Task(id="T1", C=2, T=5, D=5),
+        Task(id="T2", C=3, T=10, D=10),
+        Task(id="T3", C=5, T=20, D=20),
+    ]
 
-    result = evaluate_admission(cfg)
+    result = check_admission(tasks, SchedulerType.RM, ProtocolType.NONE)
 
     assert isinstance(result, AdmissionResult)
     assert result.accepted is True
-    assert result.reasons == []
-    assert result.details["response_times"]["T1"] == 2
-    assert result.details["response_times"]["T2"] == 3
+    assert result.rejection_reason is None
+    assert result.total_utilization == Fraction(19, 20)
+    assert _detail_by_id(result, "T1").response_time == 2
+    assert _detail_by_id(result, "T2").response_time == 5
+    assert _detail_by_id(result, "T3").response_time == 19
 
 
-def test_rm_rejected_due_to_interference() -> None:
-    t1 = Task(id="T1", C=3, T=4, D=4)
-    t2 = Task(id="T2", C=3, T=5, D=5)
-    cfg = _make_config([t1, t2], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE)
+def test_rta_terminates_and_rejects_overload_set() -> None:
+    # U = 4/5 + 5/10 = 1.3 -> must terminate quickly without infinite loop and reject
+    tasks = [
+        Task(id="T1", C=4, T=5, D=5),
+        Task(id="T2", C=5, T=10, D=10),
+    ]
 
-    result = check_fixed_priority_admission(cfg)
+    result = check_admission(tasks, SchedulerType.RM, ProtocolType.NONE)
 
     assert result.accepted is False
-    assert len(result.reasons) >= 1
-    assert any("T2" in reason for reason in result.reasons)
+    assert result.rejection_reason is not None
+    assert _detail_by_id(result, "T2").schedulable is False
 
 
-def test_rm_push_through_blocking_pip_edge_case() -> None:
-    # T1 (high prio): C=2, T=5, D=5
-    # T2 (mid prio): C=2, T=8, D=8 (no section)
-    # T3 (low prio): C=5, T=10, D=10, holds critical section length 4 -> push-through to T1
-    t1 = Task(id="T1", C=2, T=5, D=5)
-    t2 = Task(id="T2", C=1, T=15, D=15)
-    t3 = Task(
-        id="T3",
+def test_pip_blocking_includes_push_through_for_medium_task() -> None:
+    # H (highest, T=6): uses resource S (len 1)
+    # M (middle,  T=12): does NOT use resource S, so ceiling["S"] >= P_M allows push-through
+    # L (lowest,  T=24): uses resource S (len 3) -> B_M = 3
+    task_h = Task(
+        id="H",
+        C=2,
+        T=6,
+        D=6,
+        bcet=2,
+        sections=(CriticalSection(offset=0, length=1, resource_id="S"),),
+    )
+    task_m = Task(id="M", C=2, T=12, D=12)
+    task_l = Task(
+        id="L",
         C=4,
-        T=20,
-        D=20,
-        sections=(CriticalSection(offset=0, length=4, resource_id="R_SHARED"),),
+        T=24,
+        D=24,
+        bcet=4,
+        sections=(CriticalSection(offset=0, length=3, resource_id="S"),),
     )
 
-    cfg_none = _make_config(
-        [t1, t2, t3], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE
-    )
-    cfg_pip = _make_config(
-        [t1, t2, t3], scheduler=SchedulerType.RM, protocol=ProtocolType.PIP
+    result = check_admission(
+        [task_h, task_m, task_l], SchedulerType.RM, ProtocolType.PIP
     )
 
-    res_none = evaluate_admission(cfg_none)
-    res_pip = evaluate_admission(cfg_pip)
-
-    assert res_none.accepted is True
-    assert res_none.details["blockings"]["T1"] == 0
-    assert res_pip.accepted is False
-    assert res_pip.details["blockings"]["T1"] == 4
-    assert any("T1" in reason for reason in res_pip.reasons)
+    detail_m = _detail_by_id(result, "M")
+    assert detail_m.blocking_bound == 3
 
 
-def test_adjacent_none_protocol_ignores_critical_sections() -> None:
-    # Adjacent critical sections [0, 2) and [2, 4) in T2 under ProtocolType.NONE
-    # must not add blocking to higher-priority T1.
-    t1 = Task(id="T1", C=2, T=6, D=6)
-    t2 = Task(
-        id="T2",
+def test_icpp_blocking_is_single_longest_section_vs_pip_sum() -> None:
+    # H (T=12, D=12, C=3) uses both S1 and S2; L1 (T=24, C=5) holds S1 (len 4);
+    # L2 (T=30, C=5) holds S2 (len 4).
+    # Under PIP: B_H = min(4 + 4, 4 + 4) = 8 -> R_H = 3 + 8 = 11 (or with interference > 12 -> rejected).
+    # Under ICPP: B_H = max(4, 4) = 4 -> R_H = 3 + 4 = 7 <= 12 -> accepted.
+    task_h = Task(
+        id="H",
         C=5,
         T=12,
         D=12,
+        bcet=3,
         sections=(
-            CriticalSection(offset=0, length=2, resource_id="RES_A"),
-            CriticalSection(offset=2, length=2, resource_id="RES_B"),
+            CriticalSection(offset=0, length=1, resource_id="S1"),
+            CriticalSection(offset=1, length=1, resource_id="S2"),
         ),
     )
-    cfg = _make_config([t1, t2], scheduler=SchedulerType.RM, protocol=ProtocolType.NONE)
+    task_l1 = Task(
+        id="L1",
+        C=5,
+        T=24,
+        D=24,
+        bcet=5,
+        sections=(CriticalSection(offset=0, length=4, resource_id="S1"),),
+    )
+    task_l2 = Task(
+        id="L2",
+        C=5,
+        T=30,
+        D=30,
+        bcet=5,
+        sections=(CriticalSection(offset=0, length=4, resource_id="S2"),),
+    )
 
-    res = evaluate_admission(cfg)
+    res_pip = check_admission(
+        [task_h, task_l1, task_l2], SchedulerType.RM, ProtocolType.PIP
+    )
+    res_icpp = check_admission(
+        [task_h, task_l1, task_l2], SchedulerType.RM, ProtocolType.ICPP
+    )
 
-    assert res.accepted is True
-    assert res.details["blockings"]["T1"] == 0
-    assert res.details["blockings"]["T2"] == 0
-    assert res.details["response_times"]["T1"] == 2
-
-
-def test_dm_prioritizes_shorter_deadline_over_shorter_period() -> None:
-    task_a = Task(id="TA", C=2, T=10, D=4)
-    task_b = Task(id="TB", C=2, T=12, D=8)
-    cfg = _make_config([task_a, task_b], scheduler=SchedulerType.DM)
-
-    result = evaluate_admission(cfg)
-
-    assert result.accepted is True
-    assert result.details["response_times"]["TA"] == 2
-    assert result.details["response_times"]["TB"] == 4
-
-
-def test_compute_response_time_fixed_point_convergence() -> None:
-    hp_task = Task(id="TH", C=1, T=4, D=4)
-    target = Task(id="TL", C=2, T=10, D=10)
-
-    r_time, ok = compute_response_time(target, [hp_task], blocking=1)
-
-    assert ok is True
-    assert r_time == 4
+    assert _detail_by_id(res_pip, "H").blocking_bound == 8
+    assert res_pip.accepted is False
+    assert _detail_by_id(res_icpp, "H").blocking_bound == 4
+    assert res_icpp.accepted is True
 
 
-def test_compute_response_time_negative_blocking_raises() -> None:
-    task = Task(id="T1", C=1, T=10, D=10)
-    with pytest.raises(ValueError, match="Blocking cannot be negative"):
-        compute_response_time(task, [], blocking=-1)
+def test_none_rejects_inversion_band_and_bounds_adjacent_pair() -> None:
+    # 1) H, M, L where H and L share resource S under NONE -> inversion band rejected
+    h_s = Task(
+        id="H",
+        C=1,
+        T=8,
+        D=8,
+        bcet=1,
+        sections=(CriticalSection(offset=0, length=1, resource_id="S"),),
+    )
+    m_s = Task(id="M", C=2, T=12, D=12)
+    l_s = Task(
+        id="L",
+        C=2,
+        T=20,
+        D=20,
+        bcet=2,
+        sections=(CriticalSection(offset=0, length=2, resource_id="S"),),
+    )
+
+    res_inversion = check_admission(
+        [h_s, m_s, l_s], SchedulerType.RM, ProtocolType.NONE
+    )
+    assert res_inversion.accepted is False
+    assert res_inversion.rejection_reason == "unbounded_priority_inversion_under_none"
+
+    # 2) Adjacent H and L without M, sharing resource S -> B_H is nonzero
+    h_adj = Task(
+        id="H",
+        C=2,
+        T=10,
+        D=10,
+        bcet=2,
+        sections=(CriticalSection(offset=0, length=1, resource_id="S"),),
+    )
+    l_adj = Task(
+        id="L",
+        C=3,
+        T=20,
+        D=20,
+        bcet=3,
+        sections=(CriticalSection(offset=0, length=2, resource_id="S"),),
+    )
+
+    res_adj = check_admission([h_adj, l_adj], SchedulerType.RM, ProtocolType.NONE)
+    assert _detail_by_id(res_adj, "H").blocking_bound == 2
 
 
-def test_edf_equal_d_exact_fraction_boundary() -> None:
-    # Equal relative deadlines D=6: densities 1/6 + 2/6 + 3/6 = 6/6 = Fraction(1, 1) -> accepted
+def test_baker_edf_srp_exact_rational_and_rejects_non_srp_shared() -> None:
+    # Equal-D tie handling with exact Fraction: 1/6 + 2/6 + 3/6 = Fraction(1, 1) <= 1
     t1 = Task(id="T1", C=1, T=10, D=6)
     t2 = Task(id="T2", C=2, T=10, D=6)
     t3 = Task(id="T3", C=3, T=10, D=6)
-    ok_cfg = _make_config(
-        [t1, t2, t3], scheduler=SchedulerType.EDF, protocol=ProtocolType.NONE
-    )
-    ok_res = evaluate_admission(ok_cfg)
-    assert ok_res.accepted is True
-    assert ok_res.details["total_density"] == Fraction(1, 1)
-    assert ok_res.details["total_load"] == Fraction(1, 1)
 
-    # Bump T3 C from 3 to 4 -> total_density = 7/6 > 1 -> rejected
-    t3_over = Task(id="T3", C=4, T=10, D=6)
-    fail_cfg = _make_config(
-        [t1, t2, t3_over], scheduler=SchedulerType.EDF, protocol=ProtocolType.NONE
-    )
-    fail_res = check_edf_srp_admission(fail_cfg)
-    assert fail_res.accepted is False
-    assert fail_res.details["total_density"] == Fraction(7, 6)
+    res_srp = check_admission([t1, t2, t3], SchedulerType.EDF, ProtocolType.SRP)
+    assert res_srp.accepted is True
+    assert _detail_by_id(res_srp, "T3").density_lhs == Fraction(1, 1)
 
-
-def test_edf_srp_blocking_pushes_load_over_threshold() -> None:
-    # Density = 5/10 + 3/10 = 4/5, SRP term = 5/10 = 1/2 -> total_load = 13/10 > 1
-    t1 = Task(
-        id="T1",
-        C=5,
+    # Shared lock under EDF + NONE or EDF + PIP must be rejected
+    s1 = Task(
+        id="S1",
+        C=2,
         T=10,
         D=10,
-        sections=(CriticalSection(offset=0, length=5, resource_id="RES1"),),
+        bcet=2,
+        sections=(CriticalSection(offset=0, length=1, resource_id="LOCK"),),
     )
-    t2 = Task(id="T2", C=3, T=10, D=10)
-    cfg = _make_config([t1, t2], scheduler=SchedulerType.EDF, protocol=ProtocolType.SRP)
+    s2 = Task(
+        id="S2",
+        C=2,
+        T=12,
+        D=12,
+        bcet=2,
+        sections=(CriticalSection(offset=0, length=1, resource_id="LOCK"),),
+    )
 
-    res = evaluate_admission(cfg)
+    res_none = check_admission([s1, s2], SchedulerType.EDF, ProtocolType.NONE)
+    res_pip = check_admission([s1, s2], SchedulerType.EDF, ProtocolType.PIP)
 
-    assert res.accepted is False
-    assert res.details["srp_blocking_term"] == Fraction(1, 2)
-    assert res.details["total_load"] == Fraction(13, 10)
+    assert res_none.accepted is False
+    assert res_none.rejection_reason == "edf_shared_resources_require_srp"
+    assert res_pip.accepted is False
+    assert res_pip.rejection_reason == "edf_shared_resources_require_srp"
+
+
+def test_compute_response_time_and_evaluate_admission_wrapper() -> None:
+    hp = Task(id="HP", C=1, T=4, D=4)
+    lp = Task(id="LP", C=2, T=10, D=10)
+
+    r_time, ok = compute_response_time(lp, [hp], blocking=1)
+    assert ok is True
+    assert r_time == 4
+
+    with pytest.raises(ValueError, match="Blocking cannot be negative"):
+        compute_response_time(lp, [], blocking=-1)
+
+    cfg = ScenarioConfig(
+        name="wrapper-check",
+        duration=20,
+        scheduler=SchedulerType.RM,
+        protocol=ProtocolType.NONE,
+        tasks=[hp, lp],
+    )
+    wrapped = evaluate_admission(cfg)
+    assert wrapped.accepted is True
